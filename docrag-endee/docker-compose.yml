@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+  # ── Endee Vector Database ───────────────────────────────────────────────────
+  endee:
+    image: endeeio/endee-server:latest
+    container_name: endee-server
+    ports:
+      - "8080:8080"
+    ulimits:
+      nofile: 100000
+    environment:
+      NDD_NUM_THREADS: 0
+      NDD_AUTH_TOKEN: ""          # Set a token here to enable auth
+    volumes:
+      - endee-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/index/list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: docrag-api
+    ports:
+      - "8000:8000"
+    environment:
+      ENDEE_URL: "http://endee:8080/api/v1"
+      ENDEE_TOKEN: ""             # Match NDD_AUTH_TOKEN above if set
+      OPENAI_API_KEY: ""          # Optional: add your key for GPT-4o-mini answers
+    depends_on:
+      endee:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Streamlit Frontend ───────────────────────────────────────────────────────
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    container_name: docrag-ui
+    ports:
+      - "8501:8501"
+    environment:
+      API_BASE_URL: "http://api:8000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  endee-data:
