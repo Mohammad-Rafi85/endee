@@ -179,12 +179,16 @@ async def query(req: QueryRequest):
     return {"answer": answer, "sources": sources}
 
 async def generate_answer(question: str, context: str) -> str:
-    if GEMINI_API_KEY:
+    # Pull the key directly inside the function to ensure it's not empty
+    gemini_key = os.getenv("GEMINI_API_KEY", "")
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+
+    if gemini_key:
         try:
             async with httpx.AsyncClient(timeout=30) as c:
                 r = await c.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+                    f"gemini-1.5-flash:generateContent?key={gemini_key}",
                     json={"contents":[{"parts":[{"text":(
                         "Answer ONLY using the document context. "
                         "If not found, say so.\n\n"
@@ -194,8 +198,13 @@ async def generate_answer(question: str, context: str) -> str:
                 )
             if r.is_success:
                 return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception:
-            pass
+            else:
+                # This helps you debug in the terminal logs
+                print(f"Gemini API Error: {r.status_code} - {r.text}")
+        except Exception as e:
+            print(f"Gemini Connection Error: {e}")
+
+    # ... rest of your code for OpenAI and Fallback ...
 
     if OPENAI_API_KEY:
         try:
