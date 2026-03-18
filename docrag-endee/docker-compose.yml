@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # ── Endee Vector Database ───────────────────────────────────────────────────
   endee:
@@ -10,12 +8,13 @@ services:
     ulimits:
       nofile: 100000
     environment:
-      NDD_NUM_THREADS: 0
-      NDD_AUTH_TOKEN: ""          # Set a token here to enable auth
+      - NDD_NUM_THREADS=0
+      - NDD_AUTH_TOKEN=           # Leave empty or set a token
     volumes:
       - endee-data:/data
     restart: unless-stopped
     healthcheck:
+      # Ensures the API doesn't start until the DB is actually responding
       test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/index/list"]
       interval: 10s
       timeout: 5s
@@ -30,9 +29,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      ENDEE_URL: "http://endee:8080"
-      ENDEE_TOKEN: ""             # Match NDD_AUTH_TOKEN above if set
-      GEMINI_API_KEY: "AIzaSyCajNO7tWAzzExAobm6MBCnJNYchuen1fw"          # Optional: add your key for GPT-4o-mini answers
+      # SDK expects 'http://endee:8080' (it adds /api/v1 internally)
+      - ENDEE_URL=http://endee:8080
+      - ENDEE_TOKEN=
+      - GEMINI_API_KEY=AIzaSyCajNO7tWAzzExAobm6MBCnJNYchuen1fw
     depends_on:
       endee:
         condition: service_healthy
@@ -47,7 +47,8 @@ services:
     ports:
       - "8501:8501"
     environment:
-      API_BASE_URL: "http://api:8000"
+      # Tells the frontend how to reach the backend inside the Docker network
+      - API_BASE_URL=http://api:8000
     depends_on:
       - api
     restart: unless-stopped

@@ -1,10 +1,13 @@
 """
-DocRAG Backend — FastAPI + Endee Python SDK + Sentence Transformers + Gemini/OpenAI
-Uses the official Endee Python SDK exactly as documented.
+DocRAG Backend — FastAPI + Endee Python SDK + Sentence Transformers + Gemini
+Unified version with robust Gemini integration and official Endee SDK calls.
 """
 from __future__ import annotations
 
-import io, os, re, uuid
+import io
+import os
+import re
+import uuid
 from typing import Optional
 
 import httpx
@@ -13,14 +16,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# The SDK appends /api/v1 automatically.
 ENDEE_URL      = os.getenv("ENDEE_URL", "http://endee:8080")
 ENDEE_TOKEN    = os.getenv("ENDEE_TOKEN", "")
 INDEX_NAME     = "docrag"
 EMBED_DIM      = 384
 CHUNK_SIZE     = 400
 CHUNK_OVERLAP  = 60
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ── Endee SDK client ──────────────────────────────────────────────────────────
 _client = None
@@ -30,8 +32,6 @@ def get_client():
     global _client
     if _client is None:
         from endee import Endee
-        # IMPORTANT: The SDK appends /api/v1 automatically. 
-        # Set ENDEE_URL to "http://endee:8080" in docker-compose.
         _client = Endee(ENDEE_TOKEN if ENDEE_TOKEN else "")
         _client.set_base_url(ENDEE_URL) 
     return _client
@@ -46,7 +46,6 @@ def ensure_index():
     """Create the Endee index using the official SDK."""
     client = get_client()
     try:
-        # Check if index exists using the SDK
         indices = client.list_indexes()
         names = [i.name for i in indices] if indices else []
         
@@ -54,26 +53,11 @@ def ensure_index():
             client.create_index(
                 name=INDEX_NAME,
                 dimension=EMBED_DIM,
-                metric_type="cosine" # Use 'metric_type' for compatibility
+                metric_type="cosine" 
             )
             print(f"✅ Successfully created index: {INDEX_NAME}")
     except Exception as e:
         print(f"⚠️ Index check/creation failed: {e}")
-
-    if INDEX_NAME not in names:
-        try:
-            from endee import Precision
-            client.create_index(
-                name=INDEX_NAME,
-                dimension=EMBED_DIM,
-                space_type="cosine",
-                precision=Precision.INT8,
-            )
-        except Exception as e:
-            if "400" in str(e) or "exist" in str(e).lower() or "already" in str(e).lower():
-                pass
-            else:
-                print(f"[WARN] Index creation: {e}")
 
 # ── Embedder ──────────────────────────────────────────────────────────────────
 _embedder = None
@@ -134,7 +118,6 @@ async def ingest(file: UploadFile = File(...),
 
     embeddings = embed(chunks)
 
-    # Build plain dicts exactly as shown in official Endee docs
     vectors = []
     for i, (chunk, vec) in enumerate(zip(chunks, embeddings)):
         cid = str(uuid.uuid4())
@@ -145,7 +128,6 @@ async def ingest(file: UploadFile = File(...),
             "meta":   {"doc": doc_label, "chunk_index": i, "text": chunk[:200]},
         })
 
-    # Call upsert exactly as in official docs: index.upsert([{...}, {...}])
     get_index().upsert(vectors)
     return {"status": "ok", "doc": doc_label, "chunks": len(chunks)}
 
@@ -156,22 +138,17 @@ async def query(req: QueryRequest):
 
     sources, context_parts = [], []
     for h in results:
-        if isinstance(h, dict):
-            cid, score, meta = h.get("id",""), h.get("similarity",0), h.get("meta",{}) or {}
-        else:
-            cid   = getattr(h, "id", "")
-            score = getattr(h, "similarity", 0)
-            meta  = getattr(h, "meta", {}) or {}
-            if not isinstance(meta, dict):
-                meta = {}
+        cid   = h.get("id", "") if isinstance(h, dict) else getattr(h, "id", "")
+        score = h.get("similarity", 0) if isinstance(h, dict) else getattr(h, "similarity", 0)
+        meta  = (h.get("meta", {}) or {}) if isinstance(h, dict) else (getattr(h, "meta", {}) or {})
 
         stored = _doc_store.get(cid) or {
-            "text":     meta.get("text",""),
-            "doc":      meta.get("doc","unknown"),
-            "chunk_id": meta.get("chunk_index",0),
+            "text":     meta.get("text", ""),
+            "doc":      meta.get("doc", "unknown"),
+            "chunk_id": meta.get("chunk_index", 0),
         }
         sources.append({"doc": stored["doc"], "chunk_id": stored["chunk_id"],
-                        "text": stored["text"], "score": round(float(score),4)})
+                        "text": stored["text"], "score": round(float(score), 4)})
         context_parts.append(stored["text"])
 
     context = "\n\n---\n\n".join(context_parts)
@@ -179,63 +156,48 @@ async def query(req: QueryRequest):
     return {"answer": answer, "sources": sources}
 
 async def generate_answer(question: str, context: str) -> str:
-    # Pull the key directly inside the function to ensure it's not empty
-    gemini_key = os.getenv("GEMINI_API_KEY", "")
-    openai_key = os.getenv("OPENAI_API_KEY", "")
-
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    
     if gemini_key:
+        print(f"DEBUG: Attempting Gemini call with key starting with: {gemini_key[:5]}...")
         try:
             async with httpx.AsyncClient(timeout=30) as c:
-                r = await c.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"gemini-1.5-flash:generateContent?key={gemini_key}",
-                    json={"contents":[{"parts":[{"text":(
-                        "Answer ONLY using the document context. "
-                        "If not found, say so.\n\n"
-                        f"Context:\n{context}\n\nQuestion: {question}"
-                    )}]}],
-                    "generationConfig":{"maxOutputTokens":512,"temperature":0.2}},
-                )
-            if r.is_success:
-                return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            else:
-                # This helps you debug in the terminal logs
-                print(f"Gemini API Error: {r.status_code} - {r.text}")
+                # v1beta is the most stable for free-tier keys
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
+                
+                payload = {
+                    "contents": [{
+                        "parts": [{
+                            "text": f"Answer the question based ONLY on this context:\n\n{context}\n\nQuestion: {question}"
+                        }]
+                    }]
+                }
+                
+                r = await c.post(url, json=payload)
+                
+                if r.is_success:
+                    return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                else:
+                    # THIS WILL SHOW YOU THE EXACT GOOGLE ERROR
+                    print(f"❌ GOOGLE REJECTED REQUEST: {r.status_code} - {r.text}")
         except Exception as e:
-            print(f"Gemini Connection Error: {e}")
+            print(f"❌ NETWORK/CODE ERROR: {str(e)}")
 
-    # ... rest of your code for OpenAI and Fallback ...
-
-    if OPENAI_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=30) as c:
-                r = await c.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    json={"model":"gpt-4o-mini","messages":[
-                        {"role":"system","content":"Answer ONLY from context."},
-                        {"role":"user","content":f"Context:\n{context}\n\nQuestion: {question}"},
-                    ],"max_tokens":512,"temperature":0.2},
-                )
-            if r.is_success:
-                return r.json()["choices"][0]["message"]["content"].strip()
-        except Exception:
-            pass
-
+    # Fallback if the above fails
     if context:
         sentences = re.split(r"(?<=[.!?])\s+", context)
-        q_words   = set(question.lower().split())
-        best      = max(sentences, key=lambda s: len(q_words & set(s.lower().split())))
-        return (f"Based on the document: {best.strip()}\n\n"
-                f"*(Add GEMINI_API_KEY in docker-compose.yml for full AI answers.)*")
-    return "I couldn't find relevant information in the indexed documents."
+        q_words = set(question.lower().split())
+        best = max(sentences, key=lambda s: len(q_words & set(s.lower().split())))
+        return f"Based on the document: {best.strip()}\n\n(Note: Gemini logic failed. Check terminal for RED error messages.)"
+    
+    return "I couldn't find relevant information."
+
 
 @app.get("/stats")
 def stats():
     try:
         info  = get_index().describe()
-        count = info.get("vector_count", len(_doc_store)) if isinstance(info,dict) \
-                else getattr(info,"vector_count",len(_doc_store))
+        count = info.get("vector_count", 0) if isinstance(info, dict) else getattr(info, "vector_count", 0)
         return {"vector_count": count,
                 "doc_count": len({v["doc"] for v in _doc_store.values()})}
     except Exception:
