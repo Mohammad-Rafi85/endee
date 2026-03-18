@@ -1,14 +1,11 @@
 """
-DocRAG Backend — FastAPI + Endee Vector DB + Sentence Transformers + OpenAI
+DocRAG Backend — FastAPI + Endee Python SDK + Sentence Transformers + Gemini/OpenAI
+Uses the official Endee Python SDK exactly as documented.
 """
 from __future__ import annotations
 
-import io
-import os
-import re
-import textwrap
-import uuid
-from typing import List, Optional
+import io, os, re, uuid
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -16,16 +13,69 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ENDEE_URL = os.getenv("ENDEE_URL", "http://localhost:8080/api/v1")
-ENDEE_TOKEN = os.getenv("ENDEE_TOKEN", "")
-INDEX_NAME = "docrag"
-EMBED_DIM = 384          # sentence-transformers/all-MiniLM-L6-v2
-CHUNK_SIZE = 400         # chars
-CHUNK_OVERLAP = 60
+ENDEE_URL      = os.getenv("ENDEE_URL", "http://endee:8080")
+ENDEE_TOKEN    = os.getenv("ENDEE_TOKEN", "")
+INDEX_NAME     = "docrag"
+EMBED_DIM      = 384
+CHUNK_SIZE     = 400
+CHUNK_OVERLAP  = 60
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")   # optional; falls back to extractive
+# ── Endee SDK client ──────────────────────────────────────────────────────────
+_client = None
+_index  = None
 
-# ── Lazy imports ──────────────────────────────────────────────────────────────
+def get_client():
+    global _client
+    if _client is None:
+        from endee import Endee
+        # IMPORTANT: The SDK appends /api/v1 automatically. 
+        # Set ENDEE_URL to "http://endee:8080" in docker-compose.
+        _client = Endee(ENDEE_TOKEN if ENDEE_TOKEN else "")
+        _client.set_base_url(ENDEE_URL) 
+    return _client
+
+def get_index():
+    global _index
+    if _index is None:
+        _index = get_client().get_index(INDEX_NAME)
+    return _index
+
+def ensure_index():
+    """Create the Endee index using the official SDK."""
+    client = get_client()
+    try:
+        # Check if index exists using the SDK
+        indices = client.list_indexes()
+        names = [i.name for i in indices] if indices else []
+        
+        if INDEX_NAME not in names:
+            client.create_index(
+                name=INDEX_NAME,
+                dimension=EMBED_DIM,
+                metric_type="cosine" # Use 'metric_type' for compatibility
+            )
+            print(f"✅ Successfully created index: {INDEX_NAME}")
+    except Exception as e:
+        print(f"⚠️ Index check/creation failed: {e}")
+
+    if INDEX_NAME not in names:
+        try:
+            from endee import Precision
+            client.create_index(
+                name=INDEX_NAME,
+                dimension=EMBED_DIM,
+                space_type="cosine",
+                precision=Precision.INT8,
+            )
+        except Exception as e:
+            if "400" in str(e) or "exist" in str(e).lower() or "already" in str(e).lower():
+                pass
+            else:
+                print(f"[WARN] Index creation: {e}")
+
+# ── Embedder ──────────────────────────────────────────────────────────────────
 _embedder = None
 
 def get_embedder():
@@ -35,80 +85,19 @@ def get_embedder():
         _embedder = SentenceTransformer("all-MiniLM-L6-v2")
     return _embedder
 
-
-# ── Endee helpers ─────────────────────────────────────────────────────────────
-def endee_headers():
-    h = {"Content-Type": "application/json"}
-    if ENDEE_TOKEN:
-        h["Authorization"] = ENDEE_TOKEN
-    return h
-
-
-def endee_get(path: str):
-    with httpx.Client(timeout=15) as c:
-        r = c.get(f"{ENDEE_URL}{path}", headers=endee_headers())
-    r.raise_for_status()
-    return r.json()
-
-
-def endee_post(path: str, body: dict):
-    with httpx.Client(timeout=30) as c:
-        r = c.post(f"{ENDEE_URL}{path}", json=body, headers=endee_headers())
-    r.raise_for_status()
-    return r.json()
-
-
-def endee_delete(path: str):
-    with httpx.Client(timeout=15) as c:
-        r = c.delete(f"{ENDEE_URL}{path}", headers=endee_headers())
-    r.raise_for_status()
-    return r.json()
-
-
-def ensure_index():
-    """Create the Endee index if it doesn't exist yet."""
-    try:
-        existing = endee_get("/index/list")
-        names = [i["name"] for i in existing.get("indexes", [])]
-        if INDEX_NAME not in names:
-            endee_post("/index/create", {
-                "name": INDEX_NAME,
-                "dimension": EMBED_DIM,
-                "space_type": "cosine",
-                "precision": "int8",
-            })
-    except Exception as e:
-        raise RuntimeError(f"Could not ensure Endee index: {e}")
-
-
-def upsert_vectors(items: list[dict]):
-    endee_post(f"/index/{INDEX_NAME}/upsert", {"vectors": items})
-
-
-def query_vectors(vector: list[float], top_k: int):
-    result = endee_post(f"/index/{INDEX_NAME}/query", {
-        "vector": vector,
-        "top_k": top_k,
-    })
-    return result.get("results", [])
-
+def embed(texts: list) -> list:
+    return get_embedder().encode(texts, normalize_embeddings=True).tolist()
 
 # ── Text utils ────────────────────────────────────────────────────────────────
-def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+def chunk_text(text: str) -> list:
     text = re.sub(r"\s+", " ", text).strip()
     chunks, start = [], 0
     while start < len(text):
-        end = start + size
-        chunks.append(text[start:end])
-        start += size - overlap
+        chunks.append(text[start:start + CHUNK_SIZE])
+        start += CHUNK_SIZE - CHUNK_OVERLAP
     return [c.strip() for c in chunks if c.strip()]
 
-
-def embed(texts: list[str]) -> list[list[float]]:
-    return get_embedder().encode(texts, normalize_embeddings=True).tolist()
-
-
-def extract_text_from_upload(file: UploadFile) -> str:
+def extract_text(file: UploadFile) -> str:
     raw = file.file.read()
     if file.filename.lower().endswith(".pdf"):
         try:
@@ -119,146 +108,141 @@ def extract_text_from_upload(file: UploadFile) -> str:
             raise HTTPException(400, "pypdf not installed; only .txt supported")
     return raw.decode("utf-8", errors="ignore")
 
-
-# ── FastAPI app ───────────────────────────────────────────────────────────────
+# ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI(title="DocRAG API", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
-_doc_store: dict[str, dict] = {}   # chunk_id → {text, doc, chunk_id}
-
+_doc_store: dict = {}
 
 @app.on_event("startup")
 async def startup():
     ensure_index()
 
-
-# ── Routes ────────────────────────────────────────────────────────────────────
 class QueryRequest(BaseModel):
     question: str
     top_k: int = 4
 
-
 @app.post("/ingest")
-async def ingest(
-    file: UploadFile = File(...),
-    doc_name: Optional[str] = Form(None),
-):
+async def ingest(file: UploadFile = File(...),
+                 doc_name: Optional[str] = Form(None)):
     doc_label = doc_name or file.filename or "document"
-    text = extract_text_from_upload(file)
-    chunks = chunk_text(text)
+    text      = extract_text(file)
+    chunks    = chunk_text(text)
     if not chunks:
-        raise HTTPException(400, "Document produced no text chunks.")
+        raise HTTPException(400, "No text chunks found.")
 
-    vectors_payload = []
     embeddings = embed(chunks)
+
+    # Build plain dicts exactly as shown in official Endee docs
+    vectors = []
     for i, (chunk, vec) in enumerate(zip(chunks, embeddings)):
         cid = str(uuid.uuid4())
         _doc_store[cid] = {"text": chunk, "doc": doc_label, "chunk_id": i}
-        vectors_payload.append({
-            "id": cid,
+        vectors.append({
+            "id":     cid,
             "vector": vec,
-            "meta": {"doc": doc_label, "chunk_index": i, "text": chunk[:200]},
+            "meta":   {"doc": doc_label, "chunk_index": i, "text": chunk[:200]},
         })
 
-    upsert_vectors(vectors_payload)
+    # Call upsert exactly as in official docs: index.upsert([{...}, {...}])
+    get_index().upsert(vectors)
     return {"status": "ok", "doc": doc_label, "chunks": len(chunks)}
-
 
 @app.post("/query")
 async def query(req: QueryRequest):
-    q_vec = embed([req.question])[0]
-    hits = query_vectors(q_vec, req.top_k)
+    q_vec   = embed([req.question])[0]
+    results = get_index().query(vector=q_vec, top_k=req.top_k)
 
-    sources = []
-    context_parts = []
-    for h in hits:
-        cid = h.get("id", "")
+    sources, context_parts = [], []
+    for h in results:
+        if isinstance(h, dict):
+            cid, score, meta = h.get("id",""), h.get("similarity",0), h.get("meta",{}) or {}
+        else:
+            cid   = getattr(h, "id", "")
+            score = getattr(h, "similarity", 0)
+            meta  = getattr(h, "meta", {}) or {}
+            if not isinstance(meta, dict):
+                meta = {}
+
         stored = _doc_store.get(cid) or {
-            "text": h.get("meta", {}).get("text", ""),
-            "doc": h.get("meta", {}).get("doc", "unknown"),
-            "chunk_id": h.get("meta", {}).get("chunk_index", 0),
+            "text":     meta.get("text",""),
+            "doc":      meta.get("doc","unknown"),
+            "chunk_id": meta.get("chunk_index",0),
         }
-        sources.append({
-            "doc": stored["doc"],
-            "chunk_id": stored["chunk_id"],
-            "text": stored["text"],
-            "score": round(h.get("similarity", 0), 4),
-        })
+        sources.append({"doc": stored["doc"], "chunk_id": stored["chunk_id"],
+                        "text": stored["text"], "score": round(float(score),4)})
         context_parts.append(stored["text"])
 
     context = "\n\n---\n\n".join(context_parts)
-    answer = await generate_answer(req.question, context)
+    answer  = await generate_answer(req.question, context)
     return {"answer": answer, "sources": sources}
 
-
 async def generate_answer(question: str, context: str) -> str:
-    """Use OpenAI if key is set, else fall back to extractive answer."""
-    if OPENAI_API_KEY:
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a helpful assistant. Answer the user's question "
-                                "using ONLY the provided document context. If the answer "
-                                "is not in the context, say so clearly."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Context:\n{context}\n\nQuestion: {question}",
-                        },
-                    ],
-                    "max_tokens": 512,
-                    "temperature": 0.2,
-                },
-            )
-        if r.is_success:
-            return r.json()["choices"][0]["message"]["content"].strip()
+    if GEMINI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+                    json={"contents":[{"parts":[{"text":(
+                        "Answer ONLY using the document context. "
+                        "If not found, say so.\n\n"
+                        f"Context:\n{context}\n\nQuestion: {question}"
+                    )}]}],
+                    "generationConfig":{"maxOutputTokens":512,"temperature":0.2}},
+                )
+            if r.is_success:
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception:
+            pass
 
-    # Extractive fallback — return most relevant sentence from top chunk
+    if OPENAI_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    json={"model":"gpt-4o-mini","messages":[
+                        {"role":"system","content":"Answer ONLY from context."},
+                        {"role":"user","content":f"Context:\n{context}\n\nQuestion: {question}"},
+                    ],"max_tokens":512,"temperature":0.2},
+                )
+            if r.is_success:
+                return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception:
+            pass
+
     if context:
         sentences = re.split(r"(?<=[.!?])\s+", context)
-        q_words = set(question.lower().split())
-        best = max(sentences, key=lambda s: len(q_words & set(s.lower().split())))
-        return (
-            f"Based on the document: {best.strip()}\n\n"
-            f"*(Set OPENAI_API_KEY for a full generative answer.)*"
-        )
+        q_words   = set(question.lower().split())
+        best      = max(sentences, key=lambda s: len(q_words & set(s.lower().split())))
+        return (f"Based on the document: {best.strip()}\n\n"
+                f"*(Add GEMINI_API_KEY in docker-compose.yml for full AI answers.)*")
     return "I couldn't find relevant information in the indexed documents."
-
 
 @app.get("/stats")
 def stats():
     try:
-        info = endee_get(f"/index/{INDEX_NAME}/info")
-        return {
-            "vector_count": info.get("vector_count", len(_doc_store)),
-            "doc_count": len({v["doc"] for v in _doc_store.values()}),
-        }
+        info  = get_index().describe()
+        count = info.get("vector_count", len(_doc_store)) if isinstance(info,dict) \
+                else getattr(info,"vector_count",len(_doc_store))
+        return {"vector_count": count,
+                "doc_count": len({v["doc"] for v in _doc_store.values()})}
     except Exception:
         return {"vector_count": len(_doc_store), "doc_count": 0}
 
-
 @app.delete("/index")
 def clear_index():
+    global _index
     try:
-        endee_delete(f"/index/{INDEX_NAME}/vectors")
+        get_client().delete_index(INDEX_NAME)
         _doc_store.clear()
+        _index = None
+        ensure_index()
         return {"status": "cleared"}
     except Exception as e:
         raise HTTPException(500, str(e))
-
 
 @app.get("/health")
 def health():

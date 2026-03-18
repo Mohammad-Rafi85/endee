@@ -50,7 +50,7 @@ with st.sidebar:
                 files = {"file": (uploaded.name, uploaded.getvalue(), uploaded.type)}
                 data = {"doc_name": doc_name or uploaded.name}
                 try:
-                    r = requests.post(f"{API_BASE}/ingest", files=files, data=data, timeout=60)
+                    r = requests.post(f"{API_BASE}/ingest", files=files, data=data, timeout=1200)
                     if r.ok:
                         st.success(f"✅ Indexed {r.json().get('chunks', '?')} chunks!")
                     else:
@@ -117,7 +117,7 @@ if query:
             resp = requests.post(
                 f"{API_BASE}/query",
                 json={"question": query, "top_k": top_k},
-                timeout=30,
+                timeout=120,
             )
             if resp.ok:
                 data = resp.json()
